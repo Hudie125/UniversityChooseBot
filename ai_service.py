@@ -348,19 +348,81 @@ def build_expert_prompt(data: Dict[str, Any]) -> str:
     return system_instruction, user_info
 
 
+async def query_gemini(
+    system_prompt: str,
+    contents: List[Dict[str, Any]],
+    api_key: str,
+    http_proxy: Optional[str],
+) -> Optional[str]:
+    """
+    Запрос к флагманской нейросети Google Gemini (Gemini 2.0 Flash / 1.5 Flash).
+    Самая сильная модель по глубине анализа и знанию мирового образования.
+    """
+    for model in ["gemini-2.0-flash", "gemini-1.5-flash"]:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+        payload = {
+            "system_instruction": {
+                "parts": [{"text": system_prompt}]
+            },
+            "contents": contents,
+            "generationConfig": {
+                "temperature": 0.35,
+                "maxOutputTokens": 3500,
+            },
+        }
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=45)) as session:
+                async with session.post(url, json=payload, proxy=http_proxy) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        candidates = data.get("candidates", [])
+                        if candidates:
+                            parts = candidates[0].get("content", {}).get("parts", [])
+                            if parts:
+                                text = parts[0].get("text", "").strip()
+                                if text:
+                                    logger.info(f"Ответ успешно получен от Google {model}")
+                                    return text
+                    else:
+                        err = await resp.text()
+                        logger.warning(f"Google Gemini {model} вернул ошибку {resp.status}: {err[:200]}")
+        except Exception as e:
+            logger.warning(f"Ошибка запроса к Google Gemini ({model}): {e}")
+    return None
+
+
 async def query_external_ai(messages: List[Dict[str, str]], timeout_seconds: int = 40) -> Optional[str]:
     """
     Выполняет запрос к облачной нейросети.
-    Поддерживает внешние ключи (Groq, Gemini, OpenRouter) или бесплатный Pollinations.
+    Приоритет:
+    1. Google Gemini (GEMINI_API_KEY) — лучший в мире анализ
+    2. Groq Llama 3.3 70B (GROQ_API_KEY) — сверхмощный 70B
+    3. OpenRouter (OPENROUTER_API_KEY)
+    4. Бесплатный облачный сервер Pollinations.ai
     """
     proxy_url = os.getenv("PROXY_URL")
     http_proxy = None
     if proxy_url:
         http_proxy = proxy_url.replace("socks5://", "http://").replace("socks5h://", "http://")
 
-    # 1. Проверяем GROQ_API_KEY
+    # 1. Приоритет: Google Gemini API
+    gemini_key = os.getenv("GEMINI_API_KEY")
+    if gemini_key and gemini_key.strip():
+        system_msg = next((m["content"] for m in messages if m["role"] == "system"), "")
+        contents = []
+        for m in messages:
+            if m["role"] != "system":
+                role = "user" if m["role"] == "user" else "model"
+                contents.append({"role": role, "parts": [{"text": m["content"]}]})
+        if not contents:
+            contents = [{"role": "user", "parts": [{"text": "Составь анализ"}]}]
+        gemini_res = await query_gemini(system_msg, contents, gemini_key.strip(), http_proxy)
+        if gemini_res:
+            return gemini_res
+
+    # 2. Groq Llama-3.3 70B
     groq_key = os.getenv("GROQ_API_KEY")
-    if groq_key:
+    if groq_key and groq_key.strip():
         try:
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout_seconds)) as session:
                 payload = {
@@ -368,7 +430,7 @@ async def query_external_ai(messages: List[Dict[str, str]], timeout_seconds: int
                     "messages": messages,
                     "temperature": 0.4,
                 }
-                headers = {"Authorization": f"Bearer {groq_key}", "Content-Type": "application/json"}
+                headers = {"Authorization": f"Bearer {groq_key.strip()}", "Content-Type": "application/json"}
                 async with session.post("https://api.groq.com/openai/v1/chat/completions", json=payload, headers=headers, proxy=http_proxy) as r:
                     if r.status == 200:
                         res = await r.json()
@@ -376,7 +438,7 @@ async def query_external_ai(messages: List[Dict[str, str]], timeout_seconds: int
         except Exception as e:
             logger.warning(f"Groq API error: {e}")
 
-    # 2. Бесплатный облачный endpoint (Pollinations.ai)
+    # 3. Бесплатный облачный endpoint (Pollinations.ai)
     try:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout_seconds), connector=aiohttp.TCPConnector(ssl=False)) as session:
             payload = {
